@@ -2,6 +2,7 @@ mod audio_player;
 mod ffmpeg;
 mod whisper;
 mod srt_merger;
+mod recognition;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -68,6 +69,9 @@ struct WhisperApp {
     
     // 消息通道
     progress_receiver: Option<Receiver<ProgressMessage>>,
+    
+    // 重新识别
+    selected_segment_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -383,8 +387,6 @@ impl WhisperApp {
     }
     
     fn cleanup_temp_files(&mut self) {
-        use std::fs;
-        
         // 删除提取的音频文件
         if let Some(audio_path) = &self.audio_path {
             if audio_path.exists() {
@@ -405,7 +407,86 @@ impl WhisperApp {
             }
         }
         
-        self.status_message = "Recognition completed! Temporary files cleaned up.".to_string();
+        self.status_message = "Temporary files cleaned up.".to_string();
+    }
+    
+    fn rerecognize_segment(&mut self) {
+        if self.audio_segments.is_empty() || self.selected_segment_index >= self.audio_segments.len() {
+            self.status_message = "Invalid segment selection!".to_string();
+            return;
+        }
+        
+        self.state = AppState::Processing;
+        self.processing_progress = 0.0;
+        self.processing_status = "Re-recognizing segment...".to_string();
+        self.recognition_results.clear();
+        
+        let segment = self.audio_segments[self.selected_segment_index].clone();
+        let segment_index = self.selected_segment_index;
+        let all_segments = self.audio_segments.clone();
+        let model = self.whisper_model;
+        let language = self.whisper_language.clone();
+        let custom_lang = self.custom_language_code.clone();
+        let cut_points = self.cut_points.clone();
+        let video_path = self.video_path.clone().unwrap();
+        
+        // 创建消息通道
+        let (tx, rx) = channel();
+        self.progress_receiver = Some(rx);
+        
+        std::thread::spawn(move || {
+            // 重新识别单个片段
+            match recognition::recognize_single_segment(
+                &segment,
+                segment_index,
+                all_segments.len(),
+                model,
+                &language,
+                &custom_lang,
+                tx.clone(),
+            ) {
+                Ok((_srt_path, text)) => {
+                    let _ = tx.send(ProgressMessage::Result { 
+                        segment: segment_index + 1, 
+                        text 
+                    });
+                    let _ = tx.send(ProgressMessage::Progress { 
+                        current: 1, 
+                        total: 1 
+                    });
+                    
+                    // 收集所有字幕文件并重新合并
+                    let mut srt_files = Vec::new();
+                    for seg in &all_segments {
+                        let srt = seg.with_extension("srt");
+                        if srt.exists() {
+                            srt_files.push(srt);
+                        }
+                    }
+                    
+                    // 重新合并字幕
+                    if !srt_files.is_empty() {
+                        let output_path = video_path.with_extension("srt");
+                        match recognition::remerge_subtitles(&srt_files, &cut_points, &output_path) {
+                            Ok(_) => {
+                                println!("Subtitles remerged successfully: {:?}", output_path);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to remerge subtitles: {}", e);
+                                let _ = tx.send(ProgressMessage::Error(format!("Failed to remerge: {}", e)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to re-recognize segment {}: {}", segment_index + 1, e);
+                    eprintln!("{}", error_msg);
+                    let _ = tx.send(ProgressMessage::Error(error_msg));
+                }
+            }
+            
+            let _ = tx.send(ProgressMessage::Completed);
+        });
     }
     
     fn export_cut_points(&self) {
@@ -539,9 +620,8 @@ impl eframe::App for WhisperApp {
         
         if should_complete {
             self.state = AppState::AudioExtracted;
-            self.status_message = "Recognition completed! Cleaning up temporary files...".to_string();
+            self.status_message = "Recognition completed!".to_string();
             self.progress_receiver = None;
-            self.cleanup_temp_files();
         }
         
         // Update current playback position
@@ -711,6 +791,34 @@ impl eframe::App for WhisperApp {
                                     });
                                 }
                             });
+                    }
+                    
+                    ui.add_space(10.0);
+                    
+                    // Re-recognize section
+                    if !self.audio_segments.is_empty() && self.state != AppState::Processing {
+                        ui.separator();
+                        ui.label("🔄 Re-recognize Segment");
+                        ui.horizontal(|ui| {
+                            egui::ComboBox::from_label("Select segment")
+                                .selected_text(format!("Segment {}", self.selected_segment_index + 1))
+                                .show_ui(ui, |ui| {
+                                    for i in 0..self.audio_segments.len() {
+                                        ui.selectable_value(&mut self.selected_segment_index, i, format!("Segment {}", i + 1));
+                                    }
+                                });
+                            
+                            if ui.button("🎤 Re-recognize").clicked() {
+                                self.rerecognize_segment();
+                            }
+                        });
+                        
+                        ui.add_space(5.0);
+                        
+                        // Cleanup button
+                        if ui.button("🗑️ Clean Up Temp Files").clicked() {
+                            self.cleanup_temp_files();
+                        }
                     }
                     
                     ui.add_space(10.0);
