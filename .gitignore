@@ -1,0 +1,15 @@
+/target/
+Cargo.lock
+*.wav
+*.mp3
+*.m4a
+*.opus
+*.ogg
+*.flac
+*.srt
+*.mp4
+*.avi
+*.mkv
+*.mov
+.DS_Store
+
