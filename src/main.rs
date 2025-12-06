@@ -750,6 +750,38 @@ impl WhisperApp {
             None
         }
     }
+    
+    fn save_plain_text(&self) {
+        // 过滤出 Segment 开头的结果
+        let mut plain_text = String::new();
+        for result in &self.recognition_results {
+            if result.starts_with("Segment") {
+                plain_text.push_str(result);
+                plain_text.push_str("\n\n");
+            }
+        }
+        
+        if plain_text.is_empty() {
+            return;
+        }
+        
+        // 生成默认文件名
+        let video_name = self.video_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("transcript")
+            .to_string();
+        
+        // 使用文件对话框保存
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&format!("{}_transcript.txt", video_name))
+            .add_filter("Text", &["txt"])
+            .save_file()
+        {
+            let _ = fs::write(path, plain_text);
+        }
+    }
 }
 
 impl eframe::App for WhisperApp {
@@ -1113,20 +1145,13 @@ impl eframe::App for WhisperApp {
                     
                     ui.add_space(10.0);
                     
-                    // Usage instructions
-                    egui::Frame::default()
-                        .fill(egui::Color32::from_rgb(40, 40, 50))
-                        .inner_margin(10.0)
-                        .show(ui, |ui| {
-                            ui.label("📖 Usage:");
-                            ui.separator();
-                            ui.label("1. Drag video file to the left area");
-                            ui.label("2. Play audio and mark cut points");
-                            ui.label("3. Click Execute Cut");
-                            ui.label("4. Select recognition parameters");
-                            ui.label("5. Click Start Recognition");
-                            ui.label("6. Wait for subtitle generation");
-                        });
+                    // Save Plain Text button
+                    if !self.recognition_results.is_empty() {
+                        ui.separator();
+                        if ui.button("💾 Save Plain Text").clicked() {
+                            self.save_plain_text();
+                        }
+                    }
                 });
             });
         });
