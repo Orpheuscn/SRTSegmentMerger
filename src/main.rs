@@ -3,6 +3,7 @@ mod ffmpeg;
 mod whisper;
 mod srt_merger;
 mod recognition;
+mod manual_cut;
 
 use eframe::egui;
 use std::path::PathBuf;
@@ -72,6 +73,11 @@ struct WhisperApp {
     
     // 重新识别
     selected_segment_index: usize,
+    
+    // 手动切割
+    manual_start_time: String,
+    manual_end_time: String,
+    manual_segment: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -407,6 +413,17 @@ impl WhisperApp {
             }
         }
         
+        // 删除手动切割的片段
+        if let Some(manual_seg) = &self.manual_segment {
+            if manual_seg.exists() {
+                let _ = fs::remove_file(manual_seg);
+            }
+            let srt_path = manual_seg.with_extension("srt");
+            if srt_path.exists() {
+                let _ = fs::remove_file(&srt_path);
+            }
+        }
+        
         self.status_message = "Temporary files cleaned up.".to_string();
     }
     
@@ -533,6 +550,152 @@ impl WhisperApp {
                 }
             }
         }
+    }
+    
+    fn cut_manual_segment(&mut self) {
+        if let Some(audio_path) = &self.audio_path {
+            // 解析时间
+            let start_time = match manual_cut::parse_time_string(&self.manual_start_time) {
+                Ok(t) => t,
+                Err(_) => {
+                    self.status_message = "Invalid start time format!".to_string();
+                    return;
+                }
+            };
+            
+            let end_time = match manual_cut::parse_time_string(&self.manual_end_time) {
+                Ok(t) => t,
+                Err(_) => {
+                    self.status_message = "Invalid end time format!".to_string();
+                    return;
+                }
+            };
+            
+            // 切割片段
+            match manual_cut::cut_audio_segment(audio_path, start_time, end_time) {
+                Ok(segment_path) => {
+                    self.manual_segment = Some(segment_path);
+                    self.status_message = format!("Manual segment cut: {:.2}s - {:.2}s", start_time, end_time);
+                }
+                Err(e) => {
+                    self.status_message = format!("Failed to cut segment: {}", e);
+                }
+            }
+        }
+    }
+    
+    fn recognize_manual_segment(&mut self) {
+        if self.manual_segment.is_none() {
+            self.status_message = "No manual segment to recognize!".to_string();
+            return;
+        }
+        
+        self.state = AppState::Processing;
+        self.processing_progress = 0.0;
+        self.processing_status = "Recognizing manual segment...".to_string();
+        self.recognition_results.clear();
+        
+        let segment = self.manual_segment.clone().unwrap();
+        let model = self.whisper_model;
+        let language = self.whisper_language.clone();
+        let custom_lang = self.custom_language_code.clone();
+        let video_path = self.video_path.clone().unwrap();
+        let all_segments = self.audio_segments.clone();
+        let cut_points = self.cut_points.clone();
+        
+        // 解析手动片段的起始时间
+        let start_time = match manual_cut::parse_time_string(&self.manual_start_time) {
+            Ok(t) => t,
+            Err(_) => 0.0,
+        };
+        
+        // 创建消息通道
+        let (tx, rx) = channel();
+        self.progress_receiver = Some(rx);
+        
+        std::thread::spawn(move || {
+            // 识别手动片段
+            match recognition::recognize_single_segment(
+                &segment,
+                0,
+                1,
+                model,
+                &language,
+                &custom_lang,
+                tx.clone(),
+            ) {
+                Ok((_srt_path, text)) => {
+                    let _ = tx.send(ProgressMessage::Result { 
+                        segment: 0, 
+                        text 
+                    });
+                    let _ = tx.send(ProgressMessage::Progress { 
+                        current: 1, 
+                        total: 1 
+                    });
+                    
+                    // 收集所有字幕文件（包括手动片段）
+                    let mut srt_files = Vec::new();
+                    let mut segment_times = Vec::new();
+                    
+                    // 添加所有自动切割的片段
+                    for (i, seg) in all_segments.iter().enumerate() {
+                        let srt = seg.with_extension("srt");
+                        if srt.exists() {
+                            srt_files.push(srt);
+                            // 计算每段的起始时间
+                            if i == 0 {
+                                segment_times.push((0.0, srt_files.len() - 1));
+                            } else if i - 1 < cut_points.len() {
+                                segment_times.push((cut_points[i - 1], srt_files.len() - 1));
+                            }
+                        }
+                    }
+                    
+                    // 添加手动片段
+                    let manual_srt = segment.with_extension("srt");
+                    if manual_srt.exists() {
+                        srt_files.push(manual_srt);
+                        segment_times.push((start_time, srt_files.len() - 1));
+                    }
+                    
+                    // 按时间排序
+                    segment_times.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+                    
+                    // 重新排列 srt_files
+                    let mut sorted_srt_files = Vec::new();
+                    let mut sorted_cut_points = Vec::new();
+                    
+                    for (time, idx) in segment_times {
+                        sorted_srt_files.push(srt_files[idx].clone());
+                        if time > 0.0 {
+                            sorted_cut_points.push(time);
+                        }
+                    }
+                    
+                    // 合并字幕
+                    if !sorted_srt_files.is_empty() {
+                        let output_path = video_path.with_extension("srt");
+                        match recognition::remerge_subtitles(&sorted_srt_files, &sorted_cut_points, &output_path) {
+                            Ok(_) => {
+                                println!("Subtitles merged successfully: {:?}", output_path);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to merge subtitles: {}", e);
+                                let _ = tx.send(ProgressMessage::Error(format!("Failed to merge: {}", e)));
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to recognize manual segment: {}", e);
+                    eprintln!("{}", error_msg);
+                    let _ = tx.send(ProgressMessage::Error(error_msg));
+                }
+            }
+            
+            let _ = tx.send(ProgressMessage::Completed);
+        });
     }
     
     fn stop_recognition(&mut self) {
@@ -819,6 +982,35 @@ impl eframe::App for WhisperApp {
                         if ui.button("🗑️ Clean Up Temp Files").clicked() {
                             self.cleanup_temp_files();
                         }
+                    }
+                    
+                    ui.add_space(10.0);
+                    
+                    // Manual cut section
+                    if self.state != AppState::Idle && self.state != AppState::Processing {
+                        ui.separator();
+                        ui.label("✂️ Manual Cut Segment");
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Start:");
+                            ui.text_edit_singleline(&mut self.manual_start_time);
+                            ui.label("End:");
+                            ui.text_edit_singleline(&mut self.manual_end_time);
+                        });
+                        ui.label("💡 Format: HH:MM:SS or MM:SS or SS");
+                        
+                        ui.add_space(5.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("✂️ Cut Segment").clicked() {
+                                self.cut_manual_segment();
+                            }
+                            
+                            if self.manual_segment.is_some() {
+                                if ui.button("🎤 Recognize Segment").clicked() {
+                                    self.recognize_manual_segment();
+                                }
+                            }
+                        });
                     }
                     
                     ui.add_space(10.0);
