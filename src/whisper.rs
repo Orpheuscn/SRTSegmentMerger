@@ -80,13 +80,34 @@ pub fn recognize_audio_realtime(
         cmd.arg("--language").arg(lang);
     }
     
-    let mut child = cmd.spawn()?;
+    // 打印将要执行的命令（用于调试）
+    println!("🚀 Starting Whisper recognition [{}/{}]", current, total);
+    println!("   Model: {}", model.as_str());
+    println!("   Language: {:?}", language);
+    println!("   Audio: {:?}", audio_path);
+    println!("   Command: whisper {} --model {} --output_format srt --output_dir {:?} {}", 
+        audio_path.display(),
+        model.as_str(),
+        output_dir,
+        language.map(|l| format!("--language {}", l)).unwrap_or_default()
+    );
+    
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("❌ Failed to spawn whisper process: {}", e);
+            return Err(anyhow!("Failed to spawn whisper: {}", e));
+        }
+    };
+    
+    println!("   Process spawned with PID: {:?}", child.id());
     
     // 读取 stderr（Whisper 将进度输出到 stderr）
     if let Some(stderr) = child.stderr.take() {
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             if let Ok(line) = line {
+                println!("   Whisper output: {}", line);  // 打印所有输出用于调试
                 // 只发送包含有用信息的行
                 if !line.trim().is_empty() && (line.contains("[") || line.contains("Detecting language")) {
                     let msg = format!("[{}/{}] {}", current, total, line.trim());
@@ -98,7 +119,10 @@ pub fn recognize_audio_realtime(
     
     let status = child.wait()?;
     
+    println!("   Whisper process finished with status: {:?}", status);
+    
     if !status.success() {
+        eprintln!("❌ Whisper recognition failed with status: {:?}", status);
         return Err(anyhow!("Whisper recognition failed"));
     }
     
