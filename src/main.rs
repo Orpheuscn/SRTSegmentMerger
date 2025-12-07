@@ -81,6 +81,8 @@ struct WhisperApp {
     
     // 工作区
     workspace_dir: Option<PathBuf>,
+    can_resume: bool,  // 是否可以恢复识别
+    missing_segments: Vec<usize>,  // 缺失字幕的片段索引
 }
 
 #[derive(Debug, Clone)]
@@ -769,6 +771,9 @@ impl WhisperApp {
                             }
                         }
                         
+                        // 检测哪些片段缺失字幕
+                        self.check_missing_subtitles();
+                        
                         self.status_message = "Workspace loaded successfully!".to_string();
                     }
                     Err(e) => {
@@ -830,6 +835,127 @@ impl WhisperApp {
                 }
             }
         }
+    }
+    
+    fn check_missing_subtitles(&mut self) {
+        self.missing_segments.clear();
+        self.can_resume = false;
+        
+        if self.audio_segments.is_empty() {
+            return;
+        }
+        
+        // 检查每个片段是否有对应的 SRT 文件
+        for (i, segment) in self.audio_segments.iter().enumerate() {
+            let srt_path = segment.with_extension("srt");
+            if !srt_path.exists() {
+                self.missing_segments.push(i);
+            }
+        }
+        
+        // 如果有缺失且有完成的，说明可以恢复
+        self.can_resume = !self.missing_segments.is_empty() 
+            && self.missing_segments.len() < self.audio_segments.len();
+    }
+    
+    fn resume_recognition(&mut self) {
+        if self.missing_segments.is_empty() {
+            self.status_message = "No missing segments to recognize!".to_string();
+            return;
+        }
+        
+        self.state = AppState::Processing;
+        self.processing_progress = 0.0;
+        self.processing_status = "Resuming recognition...".to_string();
+        self.recognition_results.clear();
+        
+        let segments: Vec<_> = self.missing_segments.iter()
+            .filter_map(|&i| self.audio_segments.get(i).cloned())
+            .collect();
+        let missing_indices = self.missing_segments.clone();
+        let all_segments = self.audio_segments.clone();
+        let model = self.whisper_model;
+        let language = self.whisper_language.clone();
+        let custom_lang = self.custom_language_code.clone();
+        let cut_points = self.cut_points.clone();
+        let video_path = self.video_path.clone().unwrap();
+        
+        // 创建消息通道
+        let (tx, rx) = channel();
+        self.progress_receiver = Some(rx);
+        
+        std::thread::spawn(move || {
+            let total = segments.len();
+            
+            for (idx, segment) in segments.iter().enumerate() {
+                let segment_index = missing_indices[idx];
+                
+                // 确定要使用的语言代码
+                let lang_code = match language {
+                    WhisperLanguage::Unknown => None,
+                    WhisperLanguage::Japanese => Some("ja"),
+                    WhisperLanguage::English => Some("en"),
+                    WhisperLanguage::Chinese => Some("zh"),
+                    WhisperLanguage::French => Some("fr"),
+                    WhisperLanguage::German => Some("de"),
+                    WhisperLanguage::Spanish => Some("es"),
+                    WhisperLanguage::Italian => Some("it"),
+                    WhisperLanguage::Russian => Some("ru"),
+                    WhisperLanguage::Custom => {
+                        if custom_lang.is_empty() {
+                            None
+                        } else {
+                            Some(custom_lang.as_str())
+                        }
+                    }
+                };
+                
+                // 使用新的实时输出版本
+                match whisper::recognize_audio_realtime(segment, model, lang_code, tx.clone(), segment_index + 1, all_segments.len()) {
+                    Ok((_srt_path, text)) => {
+                        let _ = tx.send(ProgressMessage::Result { 
+                            segment: segment_index + 1, 
+                            text 
+                        });
+                        // 发送进度（识别完成后）
+                        let _ = tx.send(ProgressMessage::Progress { 
+                            current: idx + 1, 
+                            total 
+                        });
+                    }
+                    Err(e) => {
+                        let error_msg = format!("Failed to recognize segment {}: {}", segment_index + 1, e);
+                        eprintln!("{}", error_msg);
+                        let _ = tx.send(ProgressMessage::Error(error_msg));
+                    }
+                }
+            }
+            
+            // 合并所有字幕
+            let mut srt_files = Vec::new();
+            for seg in &all_segments {
+                let srt = seg.with_extension("srt");
+                if srt.exists() {
+                    srt_files.push(srt);
+                }
+            }
+            
+            if !srt_files.is_empty() {
+                let output_path = video_path.with_extension("srt");
+                match srt_merger::merge_srt_files(&srt_files, &cut_points, &output_path) {
+                    Ok(_) => {
+                        println!("Subtitles merged successfully: {:?}", output_path);
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to merge subtitles: {}", e);
+                        let _ = tx.send(ProgressMessage::Error(format!("Failed to merge: {}", e)));
+                    }
+                }
+            }
+            
+            // 发送完成消息
+            let _ = tx.send(ProgressMessage::Completed);
+        });
     }
 }
 
@@ -898,6 +1024,13 @@ impl eframe::App for WhisperApp {
                     
                     if ui.button("📁 Open Folder").clicked() {
                         self.open_workspace();
+                    }
+                    
+                    // Resume 按钮（在加载工作区后，如果有缺失的字幕）
+                    if self.can_resume && self.state != AppState::Processing {
+                        if ui.button("▶️ Resume").clicked() {
+                            self.resume_recognition();
+                        }
                     }
                 });
             });
