@@ -885,7 +885,8 @@ impl WhisperApp {
         self.progress_receiver = Some(rx);
         
         std::thread::spawn(move || {
-            let total = segments.len();
+            let total_segments = all_segments.len();
+            let completed_count = total_segments - missing_indices.len();  // 已完成的数量
             
             for (idx, segment) in segments.iter().enumerate() {
                 let segment_index = missing_indices[idx];
@@ -911,16 +912,16 @@ impl WhisperApp {
                 };
                 
                 // 使用新的实时输出版本
-                match whisper::recognize_audio_realtime(segment, model, lang_code, tx.clone(), segment_index + 1, all_segments.len()) {
+                match whisper::recognize_audio_realtime(segment, model, lang_code, tx.clone(), segment_index + 1, total_segments) {
                     Ok((_srt_path, text)) => {
                         let _ = tx.send(ProgressMessage::Result { 
                             segment: segment_index + 1, 
                             text 
                         });
-                        // 发送进度（识别完成后）
+                        // 发送进度（识别完成后）- 包含已完成的数量
                         let _ = tx.send(ProgressMessage::Progress { 
-                            current: idx + 1, 
-                            total 
+                            current: completed_count + idx + 1,  // 已完成 + 当前进度
+                            total: total_segments  // 总片段数
                         });
                     }
                     Err(e) => {
