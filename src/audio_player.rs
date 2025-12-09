@@ -1,9 +1,10 @@
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::process::Command;
 use anyhow::Result;
 
 pub struct AudioPlayer {
@@ -15,6 +16,7 @@ pub struct AudioPlayer {
     start_time: Arc<Mutex<std::time::Instant>>,
     paused_at: Arc<Mutex<Option<f64>>>,
     is_playing: Arc<Mutex<bool>>,
+    temp_seek_file: Arc<Mutex<Option<PathBuf>>>,  // 临时seek文件路径
 }
 
 impl AudioPlayer {
@@ -44,6 +46,7 @@ impl AudioPlayer {
             start_time: Arc::new(Mutex::new(std::time::Instant::now())),
             paused_at: Arc::new(Mutex::new(Some(0.0))),
             is_playing: Arc::new(Mutex::new(false)),
+            temp_seek_file: Arc::new(Mutex::new(None)),
         })
     }
     
@@ -82,6 +85,53 @@ impl AudioPlayer {
         }
     }
     
+    /// 使用FFmpeg创建快速seek文件
+    /// 这样可以避免rodio的skip_duration性能问题
+    fn create_seek_segment(&self, position: f64) -> Result<PathBuf> {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join(format!("whisper_seek_{}.wav", 
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()));
+        
+        // 使用FFmpeg从目标位置开始提取音频
+        // 只提取接下来的一段（比如30秒），这样文件更小，加载更快
+        let duration_to_extract = (self.duration - position).min(30.0);
+        
+        let output = Command::new("ffmpeg")
+            .arg("-ss")
+            .arg(position.to_string())
+            .arg("-i")
+            .arg(&self.audio_path)
+            .arg("-t")
+            .arg(duration_to_extract.to_string())
+            .arg("-acodec")
+            .arg("pcm_s16le")
+            .arg("-ar")
+            .arg("44100")
+            .arg("-ac")
+            .arg("2")
+            .arg("-y")
+            .arg(&temp_file)
+            .output()?;
+        
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("FFmpeg seek failed"));
+        }
+        
+        Ok(temp_file)
+    }
+    
+    /// 清理旧的临时seek文件
+    fn cleanup_temp_seek_file(&self) {
+        if let Ok(mut temp_file) = self.temp_seek_file.lock() {
+            if let Some(path) = temp_file.take() {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    
     pub fn seek(&mut self, position: f64) {
         // 限制position在有效范围内
         let position = position.max(0.0).min(self.duration);
@@ -93,33 +143,77 @@ impl AudioPlayer {
         
         // 创建新的 sink
         if let Ok(new_sink) = Sink::try_new(&self.stream_handle) {
-            // 使用更高效的方式加载音频：
-            // 对于大文件，skip_duration会很慢，因为它需要解码所有被跳过的数据
-            // 这里我们优化为只在必要时使用skip_duration
-            if let Ok(file) = File::open(&self.audio_path) {
-                if let Ok(source) = Decoder::new(BufReader::new(file)) {
-                    // 只有当seek位置不是0时才skip
-                    let final_source = if position > 0.1 {
-                        // 对于较大的seek，使用skip_duration
-                        // 注意：这仍然会慢，但我们已经优化了其他部分
-                        source.skip_duration(Duration::from_secs_f64(position))
-                    } else {
-                        source.skip_duration(Duration::from_secs_f64(0.0))
-                    };
-                    
-                    new_sink.append(final_source);
-                    
-                    let was_playing = *self.is_playing.lock().unwrap();
-                    if was_playing {
-                        new_sink.play();
-                        *self.start_time.lock().unwrap() = std::time::Instant::now() - Duration::from_secs_f64(position);
-                        *self.paused_at.lock().unwrap() = None;
-                    } else {
-                        new_sink.pause();
-                        *self.paused_at.lock().unwrap() = Some(position);
+            // 对于接近开头的位置，直接使用原文件
+            if position < 1.0 {
+                if let Ok(file) = File::open(&self.audio_path) {
+                    if let Ok(source) = Decoder::new(BufReader::new(file)) {
+                        let source = source.skip_duration(Duration::from_secs_f64(position));
+                        new_sink.append(source);
+                        
+                        let was_playing = *self.is_playing.lock().unwrap();
+                        if was_playing {
+                            new_sink.play();
+                            *self.start_time.lock().unwrap() = std::time::Instant::now() - Duration::from_secs_f64(position);
+                            *self.paused_at.lock().unwrap() = None;
+                        } else {
+                            new_sink.pause();
+                            *self.paused_at.lock().unwrap() = Some(position);
+                        }
+                        
+                        *self.sink.lock().unwrap() = new_sink;
                     }
-                    
-                    *self.sink.lock().unwrap() = new_sink;
+                }
+            } else {
+                // 对于较大的seek，使用FFmpeg预先处理
+                // 这样可以避免rodio的skip_duration性能问题
+                match self.create_seek_segment(position) {
+                    Ok(seek_file) => {
+                        // 先清理旧的临时文件
+                        self.cleanup_temp_seek_file();
+                        
+                        if let Ok(file) = File::open(&seek_file) {
+                            if let Ok(source) = Decoder::new(BufReader::new(file)) {
+                                new_sink.append(source);
+                                
+                                let was_playing = *self.is_playing.lock().unwrap();
+                                if was_playing {
+                                    new_sink.play();
+                                    *self.start_time.lock().unwrap() = std::time::Instant::now() - Duration::from_secs_f64(position);
+                                    *self.paused_at.lock().unwrap() = None;
+                                } else {
+                                    new_sink.pause();
+                                    *self.paused_at.lock().unwrap() = Some(position);
+                                }
+                                
+                                *self.sink.lock().unwrap() = new_sink;
+                                
+                                // 保存临时文件路径以便后续清理
+                                *self.temp_seek_file.lock().unwrap() = Some(seek_file);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("快速seek失败，回退到慢速模式: {}", e);
+                        // 如果FFmpeg失败，回退到原来的方法
+                        if let Ok(file) = File::open(&self.audio_path) {
+                            if let Ok(source) = Decoder::new(BufReader::new(file)) {
+                                let source = source.skip_duration(Duration::from_secs_f64(position));
+                                new_sink.append(source);
+                                
+                                let was_playing = *self.is_playing.lock().unwrap();
+                                if was_playing {
+                                    new_sink.play();
+                                    *self.start_time.lock().unwrap() = std::time::Instant::now() - Duration::from_secs_f64(position);
+                                    *self.paused_at.lock().unwrap() = None;
+                                } else {
+                                    new_sink.pause();
+                                    *self.paused_at.lock().unwrap() = Some(position);
+                                }
+                                
+                                *self.sink.lock().unwrap() = new_sink;
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -136,6 +230,13 @@ impl AudioPlayer {
     
     pub fn duration(&self) -> f64 {
         self.duration
+    }
+}
+
+impl Drop for AudioPlayer {
+    fn drop(&mut self) {
+        // 清理临时seek文件
+        self.cleanup_temp_seek_file();
     }
 }
 
