@@ -107,10 +107,11 @@ pub fn recognize_audio_realtime(
         let reader = BufReader::new(stderr);
         for line in reader.lines() {
             if let Ok(line) = line {
-                println!("   Whisper output: {}", line);  // 打印所有输出用于调试
-                // 只发送包含有用信息的行
-                if !line.trim().is_empty() && (line.contains("[") || line.contains("Detecting language")) {
-                    let msg = format!("[{}/{}] {}", current, total, line.trim());
+                let trimmed = line.trim();
+                println!("   Whisper output: {}", trimmed);  // 打印所有输出用于调试
+                // 发送所有非空的输出行到UI
+                if !trimmed.is_empty() {
+                    let msg = format!("[Segment {}/{}] {}", current, total, trimmed);
                     let _ = tx.send(ProgressMessage::RealtimeOutput(msg));
                 }
             }

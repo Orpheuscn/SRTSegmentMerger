@@ -4,16 +4,16 @@ use std::io::{BufRead, BufReader, Write};
 use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone)]
-struct SubtitleEntry {
-    index: usize,
-    start_time: String,
-    end_time: String,
-    text: Vec<String>,
+pub struct SubtitleEntry {
+    pub index: usize,
+    pub start_time: f64,  // in seconds
+    pub end_time: f64,    // in seconds
+    pub text: Vec<String>,
 }
 
-/// 解析 SRT 时间字符串为秒数
+/// Parse SRT time string to seconds
 fn parse_srt_time(time_str: &str) -> Result<f64> {
-    // 格式: HH:MM:SS,mmm
+    // Format: HH:MM:SS,mmm
     let time_str = time_str.trim();
     
     if time_str.is_empty() {
@@ -42,7 +42,7 @@ fn parse_srt_time(time_str: &str) -> Result<f64> {
     Ok(hours * 3600.0 + minutes * 60.0 + seconds + milliseconds / 1000.0)
 }
 
-/// 将秒数转换为 SRT 时间格式
+/// Convert seconds to SRT time format
 fn format_srt_time(seconds: f64) -> String {
     let hours = (seconds / 3600.0).floor() as u32;
     let minutes = ((seconds % 3600.0) / 60.0).floor() as u32;
@@ -52,8 +52,8 @@ fn format_srt_time(seconds: f64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", hours, minutes, secs, millis)
 }
 
-/// 解析单个 SRT 文件
-fn parse_srt_file(path: &Path) -> Result<Vec<SubtitleEntry>> {
+/// Parse a single SRT file
+pub fn parse_srt_file(path: &Path) -> Result<Vec<SubtitleEntry>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -67,53 +67,51 @@ fn parse_srt_file(path: &Path) -> Result<Vec<SubtitleEntry>> {
         
         if line.is_empty() {
             if let Some(entry) = current_entry.take() {
-                // 只添加有效的条目（有时间和文本）
-                if !entry.start_time.is_empty() && !entry.end_time.is_empty() {
+                if entry.start_time >= 0.0 && entry.end_time >= 0.0 && !entry.text.is_empty() {
                     entries.push(entry);
                 }
             }
             continue;
         }
         
-        // 尝试解析序号
+        // Try to parse index
         if let Ok(index) = line.parse::<usize>() {
             current_entry = Some(SubtitleEntry {
                 index,
-                start_time: String::new(),
-                end_time: String::new(),
+                start_time: -1.0,
+                end_time: -1.0,
                 text: Vec::new(),
             });
             continue;
         }
         
-        // 尝试解析时间行
+        // Try to parse time line
         if line.contains("-->") {
             let time_parts: Vec<&str> = line.split("-->").collect();
             if time_parts.len() == 2 {
                 if let Some(ref mut entry) = current_entry {
                     let start = time_parts[0].trim();
                     let end = time_parts[1].trim();
-                    // 验证时间格式非空
-                    if !start.is_empty() && !end.is_empty() {
-                        entry.start_time = start.to_string();
-                        entry.end_time = end.to_string();
+                    if let (Ok(start_time), Ok(end_time)) = (parse_srt_time(start), parse_srt_time(end)) {
+                        entry.start_time = start_time;
+                        entry.end_time = end_time;
                     }
                 }
             }
             continue;
         }
         
-        // 字幕文本
+        // Subtitle text
         if let Some(ref mut entry) = current_entry {
-            if !entry.start_time.is_empty() {
+            if entry.start_time >= 0.0 {
                 entry.text.push(line.to_string());
             }
         }
     }
     
-    // 添加最后一个条目
+    // Add last entry
     if let Some(entry) = current_entry {
-        if !entry.start_time.is_empty() && !entry.end_time.is_empty() {
+        if entry.start_time >= 0.0 && entry.end_time >= 0.0 && !entry.text.is_empty() {
             entries.push(entry);
         }
     }
@@ -121,68 +119,76 @@ fn parse_srt_file(path: &Path) -> Result<Vec<SubtitleEntry>> {
     Ok(entries)
 }
 
-/// 合并多个 SRT 文件，根据切割点调整时间戳
-pub fn merge_srt_files(
-    srt_files: &[std::path::PathBuf],
-    cut_points: &[f64],
+/// Adjust segment subtitle times by adding offset
+pub fn adjust_segment_times(segment_subs: &[SubtitleEntry], offset: f64) -> Vec<SubtitleEntry> {
+    segment_subs.iter().map(|sub| {
+        SubtitleEntry {
+            index: sub.index,
+            start_time: sub.start_time + offset,
+            end_time: sub.end_time + offset,
+            text: sub.text.clone(),
+        }
+    }).collect()
+}
+
+/// Merge segment subtitle into complete subtitle
+pub fn merge_subtitles(
+    complete_subs: Vec<SubtitleEntry>,
+    segment_subs: Vec<SubtitleEntry>,
+) -> Vec<SubtitleEntry> {
+    let mut all_subs = complete_subs;
+    all_subs.extend(segment_subs);
+    
+    // Sort by start time
+    all_subs.sort_by(|a, b| a.start_time.partial_cmp(&b.start_time).unwrap());
+    
+    // Renumber
+    for (i, sub) in all_subs.iter_mut().enumerate() {
+        sub.index = i + 1;
+    }
+    
+    all_subs
+}
+
+/// Write SRT file
+pub fn write_srt_file(path: &Path, subtitles: &[SubtitleEntry]) -> Result<()> {
+    let mut file = File::create(path)?;
+    
+    for (i, entry) in subtitles.iter().enumerate() {
+        writeln!(file, "{}", entry.index)?;
+        writeln!(file, "{} --> {}", format_srt_time(entry.start_time), format_srt_time(entry.end_time))?;
+        for line in &entry.text {
+            writeln!(file, "{}", line)?;
+        }
+        if i < subtitles.len() - 1 {
+            writeln!(file)?;
+        }
+    }
+    
+    Ok(())
+}
+
+/// Insert segment subtitle into complete subtitle at the specified time offset
+pub fn insert_segment_subtitle(
+    complete_srt_path: &Path,
+    segment_srt_path: &Path,
+    segment_start_time: f64,
     output_path: &Path,
 ) -> Result<()> {
-    let mut merged_entries = Vec::new();
-    let mut global_index = 1;
+    // Parse complete subtitle
+    let complete_subs = parse_srt_file(complete_srt_path)?;
     
-    // 计算每段的起始时间
-    let mut segment_start_times = vec![0.0];
-    segment_start_times.extend(cut_points.iter().copied());
+    // Parse segment subtitle
+    let segment_subs = parse_srt_file(segment_srt_path)?;
     
-    // 处理每个 SRT 文件
-    for (segment_idx, srt_path) in srt_files.iter().enumerate() {
-        let entries = parse_srt_file(srt_path)?;
-        let time_offset = segment_start_times[segment_idx];
-        
-        for entry in entries {
-            // 解析原始时间
-            let start_seconds = parse_srt_time(&entry.start_time)?;
-            let end_seconds = parse_srt_time(&entry.end_time)?;
-            
-            // 添加时间偏移
-            let adjusted_start = start_seconds + time_offset;
-            let adjusted_end = end_seconds + time_offset;
-            
-            // 创建新的条目
-            merged_entries.push(SubtitleEntry {
-                index: global_index,
-                start_time: format_srt_time(adjusted_start),
-                end_time: format_srt_time(adjusted_end),
-                text: entry.text.clone(),
-            });
-            
-            global_index += 1;
-        }
-    }
+    // Adjust segment times
+    let adjusted_segment = adjust_segment_times(&segment_subs, segment_start_time);
     
-    // 按时间排序（以防万一）
-    merged_entries.sort_by(|a, b| {
-        let a_time = parse_srt_time(&a.start_time).unwrap_or(0.0);
-        let b_time = parse_srt_time(&b.start_time).unwrap_or(0.0);
-        a_time.partial_cmp(&b_time).unwrap()
-    });
+    // Merge
+    let merged = merge_subtitles(complete_subs, adjusted_segment);
     
-    // 重新编号
-    for (i, entry) in merged_entries.iter_mut().enumerate() {
-        entry.index = i + 1;
-    }
-    
-    // 写入合并后的 SRT 文件
-    let mut output_file = File::create(output_path)?;
-    
-    for entry in merged_entries {
-        writeln!(output_file, "{}", entry.index)?;
-        writeln!(output_file, "{} --> {}", entry.start_time, entry.end_time)?;
-        for line in entry.text {
-            writeln!(output_file, "{}", line)?;
-        }
-        writeln!(output_file)?;  // 空行
-    }
+    // Write output
+    write_srt_file(output_path, &merged)?;
     
     Ok(())
 }

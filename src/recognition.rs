@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use anyhow::Result;
-use crate::{WhisperModel, WhisperLanguage, ProgressMessage, srt_merger, whisper};
+use crate::{WhisperModel, WhisperLanguage, ProgressMessage, whisper};
 
 /// 识别单个音频片段
 pub fn recognize_single_segment(
@@ -43,13 +43,3 @@ pub fn recognize_single_segment(
         total_segments,
     )
 }
-
-/// 重新合并所有字幕
-pub fn remerge_subtitles(
-    srt_files: &[PathBuf],
-    cut_points: &[f64],
-    output_path: &Path,
-) -> Result<()> {
-    srt_merger::merge_srt_files(srt_files, cut_points, output_path)
-}
-
